@@ -1,0 +1,538 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[ ]:
+
+
+import os
+import requests
+import xml.etree.ElementTree as ET
+import pandas as pd
+import datetime
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
+import pandas as pd
+import numpy as np       
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+import shap
+import xgboost as xgb
+from sklearn.metrics import make_scorer, mean_absolute_error
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import shap
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+import requests
+import tempfile
+import PyPDF2
+from PyPDF2.errors import PdfReadError
+import openai
+import csv
+from scholarly import scholarly
+
+
+# Calculate 'author_influence' based on H-indexes
+def calculate_author_influence(row):
+    author1_score = row['First Author H-index'] * 0.20 if not pd.isna(row['First Author H-index']) else 0
+    author2_score = row['Second Author H-index'] * 0.10 if not pd.isna(row['Second Author H-index']) else 0
+    return author1_score + author2_score
+
+# Calculate content score function
+def calculate_content_score(target_title, target_abstract, tfidf_vectorizer, ai_db_tfidf, ai_db):
+    target_text = (str(target_title) + ' ' + str(target_abstract)).strip()
+    target_tfidf = tfidf_vectorizer.transform([target_text])
+    similarities = cosine_similarity(target_tfidf, ai_db_tfidf).flatten()
+    total_similarity = np.sum(similarities)
+    normalized_similarities = similarities / total_similarity if total_similarity != 0 else similarities
+    weighted_similarity = normalized_similarities * ai_db['Citation Count'] * ai_db['time_weights']
+    content_score = np.sum(weighted_similarity)
+    return max(content_score, 0)
+
+################################## Build Score Prediction Model ######################################
+
+def build_model():
+	# Load dataset
+	ai_db = pd.read_csv('https://raw.githubusercontent.com/tl3378/Lab_dataset/refs/heads/main/team%202%20dataset.csv')
+
+	# Convert 'Citation Count' to numeric and fill NaNs
+	ai_db['Citation Count'] = pd.to_numeric(ai_db['Citation Count'], errors='coerce').fillna(0)
+
+	# Compute 'Days Since Publish'
+	today = pd.Timestamp.now().replace(tzinfo=None)
+	ai_db['Published Date'] = pd.to_datetime(ai_db['Published Date'], errors='coerce').dt.tz_localize(None)
+	ai_db['Days Since Publish'] = (today - ai_db['Published Date']).dt.days.fillna(0)
+
+	# Calculate 'time_weights'
+	ai_db['time_weights'] = ai_db['Citation Count'] / ai_db['Days Since Publish']
+	ai_db['time_weights'] = ai_db['time_weights'].fillna(0)
+
+	ai_db['author_influence'] = ai_db.apply(calculate_author_influence, axis=1)
+
+	# Prepare corpus for TF-IDF based on Title and Abstract
+	corpus = (ai_db['Title'].fillna('') + ' ' + ai_db['Abstract'].fillna('')).tolist()
+
+	# Compute TF-IDF features
+	tfidf_vectorizer = TfidfVectorizer(stop_words='english')
+	ai_db_tfidf = tfidf_vectorizer.fit_transform(corpus)
+
+	# Apply content score calculation for each paper
+	ai_db['content_score'] = ai_db.apply(
+	    lambda row: calculate_content_score(row['Title'], row['Abstract'], tfidf_vectorizer, ai_db_tfidf, ai_db), axis=1
+	)
+
+	# train(60%) and test (40%)
+	train_data = ai_db[:int(0.6 * len(ai_db))]
+	test_data = ai_db[int(0.6 * len(ai_db)):] 
+
+	# features and targets
+	X_train, y_train = train_data[['author_influence', 'content_score']], train_data['Citation Count']
+	X_test, y_test = test_data[['author_influence', 'content_score']], test_data['Citation Count']
+
+	# Standardize features
+	scaler = StandardScaler()
+	X_train_scaled = scaler.fit_transform(X_train)
+	X_test_scaled = scaler.transform(X_test)
+
+	# XGBoost model and GridSearchCV for hyperparameter tuning
+	xgb_model = xgb.XGBRegressor(objective='reg:squarederror', random_state=42)
+	param_grid = {
+	    'n_estimators': [50, 100, 200],
+	    'learning_rate': [0.01, 0.1, 0.2],
+	    'max_depth': [3, 5, 7],
+	    'min_child_weight': [1, 3, 5],
+	    'subsample': [0.8, 1],
+	    'colsample_bytree': [0.8, 1]
+	}
+	mae_scorer = make_scorer(mean_absolute_error, greater_is_better=False)
+	grid_search = GridSearchCV(xgb_model, param_grid, scoring=mae_scorer, cv=5, n_jobs=-1)
+	grid_search.fit(X_train_scaled, y_train)
+
+	best_model = grid_search.best_estimator_
+	print('Test best model output on database: training data')
+	print(best_model.predict(X_train_scaled))
+	print('Test best model output on database: testing data')
+	print(best_model.predict(X_test_scaled))
+	# Best model from grid search
+	return best_model, tfidf_vectorizer, ai_db_tfidf, ai_db
+
+
+################################## Fetch Papers ######################################
+
+
+def build_new_papers():
+
+    # Define the search query to include multiple AI-related topics
+    query_topics = 'ti:"Retrieval Augmented Generation" OR ti:"RAG" OR ti:"Reinforcement Learning" OR ti:"Responsible AI" OR ti:"AI Alignment" OR ti:"Explainable AI" OR ti:"Adversarial AI" OR ti:"Adversarial Machine Learning" OR ti:"Compound AI" OR ti:"Ontology" OR ti:"Neurosymbolic AI"'
+
+    # API URL with multiple topics and sorting by relevance
+    url = f'http://export.arxiv.org/api/query?search_query={query_topics}&sortBy=relevance&max_results=2000'
+
+    # Define the topics and their variations for categorization
+    topics_dict = {
+        'Retrieval Augmented Generation': 'Retrieval Augmented Generation',
+        'RAG': 'RAG',
+        'Reinforcement Learning': 'Reinforcement Learning',
+        'Responsible AI': 'Responsible AI',
+        'AI Alignment': 'AI Alignment',
+        'Explainable AI': 'Explainable AI',
+        'Adversarial AI': 'Adversarial AI',
+        'Adversarial Machine Learning': 'Adversarial Machine Learning',
+        'Compound AI': 'Compound AI Systems',
+        'Ontology': 'Ontology',
+        'Neurosymbolic AI': 'Neurosymbolic AI'
+    }
+
+    # Initialize lists to store the data
+    titles = []
+    article_links = []
+    pdf_links = []
+    authors_list = []
+    publish_dates = []
+    paper_topics = []
+    abstracts = []
+    first_author_name = []
+    first_author_h_index = []
+    second_author_name = []
+    second_author_h_index = []
+
+    # OpenAlex API base URL
+    openalex_base_url = "https://api.openalex.org"
+
+    # Create a session with retry logic
+    session = requests.Session()
+    retries = Retry(total=5, backoff_factor=0.1, status_forcelist=[500, 502, 503, 504])
+    session.mount('http://', HTTPAdapter(max_retries=retries))
+
+    # Define the date range for the last 30 days
+    today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=30)
+
+    # Function to identify the topic of a paper based on its title
+    def identify_topics(title):
+        matched_topics = []
+        for topic, display_name in topics_dict.items():
+            if topic.lower() in title.lower():
+                matched_topics.append(display_name)
+        return ', '.join(matched_topics) if matched_topics else 'Other'
+
+    def calculate_h_index(author_name):
+	    try:
+	        # Search for the author
+	        search_query = scholarly.search_author(author_name)
+	        author = next(search_query)
+	        author = scholarly.fill(author)  # Fetches detailed author information
+	        
+	        # Get the citations for each publication
+	        citations = [pub['num_citations'] for pub in author['publications'] if 'num_citations' in pub]
+	        citations.sort(reverse=True)
+
+	        # Calculate h-index
+	        h_index = sum(1 for i, c in enumerate(citations) if c >= i + 1)
+	        return h_index
+	    except Exception as e:
+	        print(f"Error processing {author_name}: {e}")
+	        return 'N/A'
+
+    # Function to fetch papers
+    def fetch_papers(api_url):
+        try:
+            response = session.get(api_url, timeout=5000)
+            response.raise_for_status()
+
+            # Parse the XML response
+            root = ET.fromstring(response.content)
+            
+            for entry in root.findall('{http://www.w3.org/2005/Atom}entry'):
+                title = entry.find('{http://www.w3.org/2005/Atom}title').text
+                link = entry.find('{http://www.w3.org/2005/Atom}id').text
+                pdf_link = link.replace("abs", "pdf") + ".pdf"
+                publish_date = entry.find('{http://www.w3.org/2005/Atom}published').text
+                publish_date_obj = datetime.datetime.strptime(publish_date, '%Y-%m-%dT%H:%M:%SZ').date()
+                abstract = entry.find('{http://www.w3.org/2005/Atom}summary').text.strip()
+                
+                # Filter papers within the last 30 days
+                if start_date <= publish_date_obj <= today:
+                    authors = [author.find('{http://www.w3.org/2005/Atom}name').text for author in entry.findall('{http://www.w3.org/2005/Atom}author')]
+                    topic = identify_topics(title)
+                    
+                    # Fetch citation count for the first and second authors if available
+                    if len(authors) > 0:
+                        first_author_name.append(authors[0])
+                        h_index_1 = calculate_h_index(authors[0])
+                        first_author_h_index.append(h_index_1)
+                        print(f"{authors[0]}'s h-index is: {h_index_1}")
+                    else:
+                        first_author_name.append('N/A')
+                        first_author_h_index.append('N/A')
+                    
+                    if len(authors) > 1:
+                        second_author_name.append(authors[1])
+                        h_index_2 = calculate_h_index(authors[1])
+                        second_author_h_index.append(h_index_2)
+                    else:
+                        second_author_name.append('N/A')
+                        second_author_h_index.append('N/A')
+                    
+                    # Truncate the abstract to 200 characters for a compact view
+                    truncated_abstract = (abstract[:200] + "...") if len(abstract) > 200 else abstract
+                    
+                    # Append data to lists
+                    titles.append(title)
+                    article_links.append(link)
+                    pdf_links.append(pdf_link)
+                    authors_list.append(", ".join(authors))
+                    publish_dates.append(publish_date)
+                    paper_topics.append(topic)
+                    abstracts.append(truncated_abstract)
+
+        except requests.exceptions.RequestException as e:
+            print(f"An error occurred: {e}")
+
+
+    # Fetch the papers
+    fetch_papers(url)
+
+    # Create a DataFrame with the article titles hyperlinked, topic information, and truncated abstracts
+    df = pd.DataFrame({
+        'Title': [f'=HYPERLINK("{link}", "{title}")' for title, link in zip(titles, article_links)],
+        'Authors': authors_list,
+        'Publish Date': publish_dates,
+        'Topic': paper_topics,
+        'PDF Link': pdf_links,
+        'Abstract': abstracts,
+        'First Author Name': first_author_name,
+        'First Author H-index': first_author_h_index,
+        'Second Author Name': second_author_name,
+        'Second Author H-index': second_author_h_index
+    })
+
+    return df
+
+
+################################ Summary ######################################
+# Function to get prompt
+def get_prompt(text: str) -> str:
+    return f""" Summarize the following text in 400 characters. Some aspects to include: Addressing What Problem, Solutions and Methodology, Key Findings, and Real World Impact. Make it friendly to a non technical audience.
+Text: {text}
+Summarization:
+"""
+
+# Function to summarize text using ChatCompletion -
+def summarize_text(model: str, text: str) -> str:
+    prompt = get_prompt(text)
+    messages = [{"role": "user", "content": prompt}]
+    response = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        max_tokens=150,
+        temperature=0.7
+    )
+    return response.choices[0].message.content.strip()
+
+
+
+
+# Define a function to process each PDF link, extract text, and summarize
+def process_pdf(pdf_link):
+	# Function to extract text from a PDF file
+	def extract_text_from_pdf(pdf_path: str, max_pages: int = 5) -> str:
+	    text = ""
+	    try:
+	      with open(pdf_path, "rb") as file:
+	          reader = PyPDF2.PdfReader(file)
+	          num_pages = min(len(reader.pages), max_pages)  # Limit the number of pages to extract
+	          for page_num in range(num_pages):
+	              page = reader.pages[page_num]
+	              text += page.extract_text() + "\n"
+	          else:
+	              text += "[Warning: Page could not be read]\n"
+	    except PdfReadError as e:
+	        print(f"Error reading PDF: {e}")
+	        return "[Error: Could not extract text from the PDF]"
+
+	    return text
+	def summarize_text(model: str, text: str) -> str:
+	    import os
+	    from openai import OpenAI
+	    #os.environ['OPENAI_API_KEY'] = "" #paid API Key
+	    os.environ['OPENAI_API_KEY'] = "" #paid API Key
+	    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+	    prompt = get_prompt(text)
+	    conversation = [{"role": "user", "content": prompt}]
+	    response = client.chat.completions.create(model=model, messages=conversation)
+	    return response.choices[0].message.content
+
+
+	# Function to download PDF from URL
+	def download_pdf_from_url(url: str) -> str:
+	    response = requests.get(url)
+	    if response.status_code == 200:
+	        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+	        with open(temp_file.name, 'wb') as f:
+	            f.write(response.content)
+	        return temp_file.name
+	    else:
+	        raise Exception("Failed to download PDF")
+
+	pdf_content = extract_text_from_pdf(download_pdf_from_url(pdf_link))
+	return summarize_text(model="gpt-4", text=pdf_content)
+
+def main():
+	# Load the best model
+	best_model, tfidf_vectorizer, ai_db_tfidf, ai_db = build_model()
+	print('Best Model Sucdessfully Built')
+	new_papers = build_new_papers()
+
+	print('All new papers fetched. Display the head: ')
+	print(new_papers.head())
+
+	new_papers['First Author H-index'] = pd.to_numeric(new_papers['First Author H-index'], errors='coerce')
+	new_papers['Second Author H-index'] = pd.to_numeric(new_papers['Second Author H-index'], errors='coerce')
+
+	new_papers['author_influence'] = new_papers.apply(calculate_author_influence, axis=1)
+
+	# Apply content score calculation for each paper
+	new_papers['content_score'] = new_papers.apply(lambda row: calculate_content_score(row['Title'], row['Abstract'], tfidf_vectorizer, ai_db_tfidf, ai_db), axis=1)
+
+
+	print('Calculate author and content score. Display the head: ')
+	print(new_papers.head())
+
+	# Features for ranking
+	X_new = new_papers[['content_score', 'author_influence']]
+
+	# Standardize features
+	scaler = StandardScaler()
+	X_new_scaled = scaler.fit_transform(X_new)
+	
+	print('Features from new papers:')
+	print(X_new_scaled)
+
+	# Predict scores for new papers
+	y_new_pred = best_model.predict(X_new_scaled)
+
+	print('Scores for new papers')
+	print(y_new_pred)
+
+	new_papers['Predicted_Score'] = y_new_pred
+
+	# Rank papers by predicted score
+	top_15_papers = new_papers.nlargest(15, 'Predicted_Score').reset_index(drop=True)
+	top_15_papers.index += 1
+	top_15_papers_output = top_15_papers[['Title', 'Abstract', 'PDF Link', 'First Author Name', 'First Author H-index', 
+	                                      'Second Author Name', 'Second Author H-index', 'Predicted_Score', 'Publish Date', 'Topic']]
+	top_15_papers_output.insert(0, 'Rank', top_15_papers_output.index)
+
+	# Fill missing values with appropriate data type values
+	top_15_papers_output = top_15_papers_output.fillna({
+	    col: 0 if top_15_papers_output[col].dtype == 'float64' else ('N/A' if top_15_papers_output[col].dtype == 'object' else pd.NaT)
+	    for col in top_15_papers_output.columns
+	})
+
+	# Save and print the top 15 impactful papers
+	top_15_papers_output.to_csv("top_15_impactful_papers_new.csv", index=False)
+	print('Topc 15 papers selected!')
+	print(top_15_papers_output)
+
+
+	os.environ['OPENAI_API_KEY'] = ""
+	client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+	top_15_papers_output['Summary'] = top_15_papers_output['PDF Link'].apply(process_pdf)
+
+	top_15_papers_output.to_csv('ranked_summaries.csv', index=False, encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()
+
+
+# In[ ]:
+
+
+get_ipython().system('pip install PyGithub')
+get_ipython().system('pip install markdown2')
+get_ipython().system('pip install requests')
+
+import os
+import pandas as pd
+from github import Github
+
+# Replace these with your GitHub credentials
+GITHUB_TOKEN = ''
+REPO_NAME = "angelicadxm/406_Ventures"  # Format: username/repo_name
+CSV_FILE_PATH = "/Users/angelica/Desktop/ranked_summaries.csv"
+MARKDOWN_TEMPLATE = """
+![](logo.png)
+# 🧠 Monthly AI Paper Roundup: Top AI Research Papers 
+
+Welcome to our curated list of the **top AI research papers** from the past month. Here we summarize and highlight the most impactful papers across key AI domains, including **Reinforcement Learning**, **Explainable AI**, **Ontology**, and more. This roundup aims to make cutting-edge AI research accessible for non-technical audiences. 🚀
+
+---
+
+## 📜 Overview
+The selected papers cover advancements in **AI-driven models** within **language processing, image editing, video animation**, and **cross-modal applications**. Common themes include improving efficiency, leveraging novel architectures, and advancing generalization capabilities. Many of these papers emphasize rigorous **benchmarking** and **dataset creation** to push forward the field of AI. 
+
+Each entry includes a brief summary, publication details, and direct links to the paper PDFs for easy access. 📄✨
+
+---
+
+## 🏆 Top 15 AI Research Papers
+
+{content}
+
+---
+
+## 🙏 Acknowledgments
+We would like to extend our gratitude to our instructor Charlie Riemann and two lovely mentors Kevin C. Wang and Austin Kwoun for their invaluable guidance and support throughout this project. Their insights and expertise have been instrumental in bringing this work to fruition. Thank you! 💗
+
+---
+
+### Dashboard Development
+Our dashboard is hosted on GitHub and is dynamically updated every month. Stay tuned for more updates! 🚀
+"""
+
+def clean_title(hyperlink_text):
+    """
+    Cleans the title by extracting the plain text after =HYPERLINK.
+    """
+    if hyperlink_text.startswith('=HYPERLINK'):
+        # Extract the part after the comma, strip quotes
+        return hyperlink_text.split('", ')[-1].strip('"')
+    return hyperlink_text
+
+def upload_to_github(csv_file_path, repo_name, github_token):
+    # Initialize GitHub client
+    g = Github(github_token)
+    try:
+        repo = g.get_repo(repo_name)
+    except Exception as e:
+        raise ValueError(f"Unable to access repository {repo_name}. Please check the repository name and token permissions: {e}")
+    
+    # Check if the CSV file already exists in the repo
+    contents = None
+    try:
+        contents = repo.get_contents(os.path.basename(csv_file_path))
+    except Exception:
+        pass  # File doesn't exist yet
+
+    # Upload or update the CSV file
+    with open(csv_file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+    if contents:
+        repo.update_file(contents.path, "Update CSV file", content, contents.sha)
+        print(f"Updated file {os.path.basename(csv_file_path)} in the repository.")
+    else:
+        repo.create_file(os.path.basename(csv_file_path), "Add CSV file", content)
+        print(f"Uploaded file {os.path.basename(csv_file_path)} to the repository.")
+
+def update_dashboard(csv_file_path, repo_name, github_token):
+    # Load the CSV data
+    df = pd.read_csv(csv_file_path)
+    
+    # Clean Title column
+    df['Title'] = df['Title'].apply(clean_title)
+    
+    # Ensure Abstract column is clean
+    df['Abstract'] = df['Abstract'].fillna("No summary available.")
+    
+    # Generate Markdown entries for the top 15 papers
+    markdown_content = ""
+    for index, row in df.iterrows():
+        markdown_content += f"""
+### {index + 1}. {row['Title']} 📈
+
+- **Authors**: {row['First Author Name']} (H-index: {row['First Author H-index']}), {row['Second Author Name']} (H-index: {row['Second Author H-index']})
+- **Published**: {row['Publish Date']}
+- **Summary**: {row['Abstract']}
+- [📄 PDF Link]({row['PDF Link']})
+"""
+    
+    # Generate full Markdown content
+    markdown_text = MARKDOWN_TEMPLATE.format(content=markdown_content)
+    
+    # Save the Markdown file
+    markdown_file_path = "README.md"
+    with open(markdown_file_path, 'w', encoding='utf-8') as md_file:
+        md_file.write(markdown_text)
+    
+    # Upload the Markdown file to GitHub
+    upload_to_github(markdown_file_path, repo_name, github_token)
+
+# Main function to automate the dashboard update
+if __name__ == '__main__':
+    # Upload the CSV file to GitHub
+    upload_to_github(CSV_FILE_PATH, REPO_NAME, GITHUB_TOKEN)
+    # Update the Dashboard's Markdown file
+    update_dashboard(CSV_FILE_PATH, REPO_NAME, GITHUB_TOKEN)
+
+
+# In[ ]:
+
+
+
+
